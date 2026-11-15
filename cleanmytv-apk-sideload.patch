@@ -1,0 +1,228 @@
+diff --git a/src/main/apk.ts b/src/main/apk.ts
+index 8986211..2e5b91a 100644
+--- a/src/main/apk.ts
++++ b/src/main/apk.ts
+@@ -1,6 +1,7 @@
+ // Reads an APK's package name and version before it goes to the TV, so the app can say what it is about
+ // to install and whether that's an update. An APK is a zip; its AndroidManifest.xml is Android's binary
+ // XML. This reads only the <manifest> element, with Node's own zlib and no extra library.
++import { closeSync, fstatSync, openSync, readSync } from 'node:fs'
+ import { inflateRawSync } from 'node:zlib'
+ 
+ export interface ApkInfo {
+@@ -9,31 +10,62 @@ export interface ApkInfo {
+   versionCode?: number
+ }
+ 
+-/** The raw bytes of one file inside a zip, or null when it isn't there. */
+-export function zipEntry(zip: Buffer, name: string): Buffer | null {
++/** A manifest is small; anything claiming more is not one. Bounds what a crafted entry can make us allocate. */
++const MAX_MANIFEST = 8 * 1024 * 1024
++const MAX_DIRECTORY = 16 * 1024 * 1024
++
++/** Where zip bytes come from: a buffer, or a file read in pieces so a big APK is never loaded whole. */
++interface ZipSource {
++  size: number
++  read(at: number, length: number): Buffer
++}
++
++const fromBuffer = (zip: Buffer): ZipSource => ({ size: zip.length, read: (at, length) => zip.subarray(at, at + length) })
++
++function fromFile(fd: number): ZipSource {
++  return {
++    size: fstatSync(fd).size,
++    read(at, length) {
++      const out = Buffer.alloc(length)
++      const got = readSync(fd, out, 0, length, at)
++      return got === length ? out : out.subarray(0, got)
++    }
++  }
++}
++
++function entryFrom(src: ZipSource, name: string): Buffer | null {
+   // The end-of-central-directory record sits in the last 64 KB plus 22 bytes.
+-  const from = Math.max(0, zip.length - 65557)
++  const tailAt = Math.max(0, src.size - 65557)
++  const tail = src.read(tailAt, src.size - tailAt)
+   let eocd = -1
+-  for (let i = zip.length - 22; i >= from; i--) {
+-    if (zip.readUInt32LE(i) === 0x06054b50) { eocd = i; break }
++  for (let i = tail.length - 22; i >= 0; i--) {
++    if (tail.readUInt32LE(i) === 0x06054b50) { eocd = i; break }
+   }
+   if (eocd < 0) return null
+-  const count = zip.readUInt16LE(eocd + 10)
+-  let p = zip.readUInt32LE(eocd + 16)
+-  for (let n = 0; n < count && p + 46 <= zip.length; n++) {
+-    if (zip.readUInt32LE(p) !== 0x02014b50) return null
+-    const method = zip.readUInt16LE(p + 10)
+-    const csize = zip.readUInt32LE(p + 20)
+-    const nameLen = zip.readUInt16LE(p + 28)
+-    const extraLen = zip.readUInt16LE(p + 30)
+-    const commentLen = zip.readUInt16LE(p + 32)
+-    const local = zip.readUInt32LE(p + 42)
+-    if (zip.toString('utf8', p + 46, p + 46 + nameLen) === name) {
+-      if (zip.readUInt32LE(local) !== 0x04034b50) return null
+-      const start = local + 30 + zip.readUInt16LE(local + 26) + zip.readUInt16LE(local + 28)
+-      const data = zip.subarray(start, start + csize)
++  const count = tail.readUInt16LE(eocd + 10)
++  const dirSize = tail.readUInt32LE(eocd + 12)
++  const dirAt = tail.readUInt32LE(eocd + 16)
++  if (dirSize > MAX_DIRECTORY || dirAt + dirSize > src.size) return null
++  const dir = src.read(dirAt, dirSize)
++  let p = 0
++  for (let n = 0; n < count && p + 46 <= dir.length; n++) {
++    if (dir.readUInt32LE(p) !== 0x02014b50) return null
++    const method = dir.readUInt16LE(p + 10)
++    const csize = dir.readUInt32LE(p + 20)
++    const nameLen = dir.readUInt16LE(p + 28)
++    const extraLen = dir.readUInt16LE(p + 30)
++    const commentLen = dir.readUInt16LE(p + 32)
++    const local = dir.readUInt32LE(p + 42)
++    if (dir.toString('utf8', p + 46, p + 46 + nameLen) === name) {
++      if (csize > MAX_MANIFEST || local + 30 > src.size) return null
++      const head = src.read(local, 30)
++      if (head.length < 30 || head.readUInt32LE(0) !== 0x04034b50) return null
++      const start = local + 30 + head.readUInt16LE(26) + head.readUInt16LE(28)
++      if (start + csize > src.size) return null
++      const data = src.read(start, csize)
+       if (method === 0) return Buffer.from(data)
+-      if (method === 8) return inflateRawSync(data)
++      // Capped: deflate can expand a thousand-fold, and this entry comes from a file we don't trust.
++      if (method === 8) return inflateRawSync(data, { maxOutputLength: MAX_MANIFEST })
+       return null
+     }
+     p += 46 + nameLen + extraLen + commentLen
+@@ -41,6 +73,11 @@ export function zipEntry(zip: Buffer, name: string): Buffer | null {
+   return null
+ }
+ 
++/** The raw bytes of one file inside a zip, or null when it isn't there. */
++export function zipEntry(zip: Buffer, name: string): Buffer | null {
++  return entryFrom(fromBuffer(zip), name)
++}
++
+ // android:versionCode and android:versionName, for manifests whose attribute names were stripped.
+ const RES_VERSION_CODE = 0x0101021b
+ const RES_VERSION_NAME = 0x0101021c
+@@ -118,3 +155,17 @@ export function apkInfo(apk: Buffer): ApkInfo | null {
+     return null
+   }
+ }
++
++/** Same as apkInfo, for a file on disk: reads only the zip directory and the manifest, not the whole APK. */
++export function apkInfoFromFile(path: string): ApkInfo | null {
++  let fd = -1
++  try {
++    fd = openSync(path, 'r')
++    const xml = entryFrom(fromFile(fd), 'AndroidManifest.xml')
++    return xml ? manifestInfo(xml) : null
++  } catch {
++    return null
++  } finally {
++    if (fd >= 0) closeSync(fd)
++  }
++}
+diff --git a/src/main/sideload.ts b/src/main/sideload.ts
+index b570273..bd92253 100644
+--- a/src/main/sideload.ts
++++ b/src/main/sideload.ts
+@@ -4,7 +4,7 @@ import { readFileSync, statSync } from 'node:fs'
+ import { basename, extname } from 'node:path'
+ import * as T from './tv'
+ import { log, progress } from './log'
+-import { apkInfo } from './apk'
++import { apkInfoFromFile } from './apk'
+ import type { ApplyResult, SideloadInfo } from '@shared/api'
+ 
+ const TASK = 'sideload'
+@@ -12,7 +12,8 @@ const TMP = '/data/local/tmp/cmtv-sideload.apk'
+ const MAX_BYTES = 1024 * 1024 * 1024
+ const HOME_PKG = 'io.github.wingedpanther.cleanmytv.home'
+ 
+-function readApk(path: string): Buffer {
++/** Checks the name, type and size of the chosen file. Nothing is read yet. */
++function checkApk(path: string): number {
+   if (typeof path !== 'string' || !path) throw new Error('Pick an .apk file.')
+   const ext = extname(path).toLowerCase()
+   if (ext === '.apks' || ext === '.xapk' || ext === '.apkm') {
+@@ -22,7 +23,7 @@ function readApk(path: string): Buffer {
+   const st = statSync(path)
+   if (!st.isFile()) throw new Error(`${basename(path)} isn't a file.`)
+   if (st.size > MAX_BYTES) throw new Error(`${basename(path)} is over 1 GB.`)
+-  return readFileSync(path)
++  return st.size
+ }
+ 
+ async function installedVersion(pkg: string): Promise<string | null> {
+@@ -33,12 +34,12 @@ async function installedVersion(pkg: string): Promise<string | null> {
+ 
+ /** What the file is and whether the TV has it already, before anything is uploaded. */
+ export async function inspect(path: string): Promise<SideloadInfo> {
+-  const data = readApk(path)
+-  const info = apkInfo(data)
++  const size = checkApk(path)
++  const info = apkInfoFromFile(path)
+   if (!info || !T.PACKAGE_RE.test(info.package)) throw new Error(`${basename(path)} doesn't look like an Android app.`)
+   return {
+     file: basename(path),
+-    size: data.length,
++    size,
+     package: info.package,
+     versionName: info.versionName ?? null,
+     installed: await installedVersion(info.package)
+@@ -57,15 +58,17 @@ const REASONS: [RegExp, string][] = [
+ ]
+ 
+ export async function install(path: string): Promise<ApplyResult> {
+-  const data = readApk(path)
+-  const info = apkInfo(data)
++  const size = checkApk(path)
++  const info = apkInfoFromFile(path)
+   if (!info || !T.PACKAGE_RE.test(info.package)) throw new Error(`${basename(path)} doesn't look like an Android app.`)
+   if (info.package === HOME_PKG) throw new Error('That is CleanMyTV Home. Install it from the Home screen step, which also sets it up.')
+   const name = `${info.package}${info.versionName ? ` ${info.versionName}` : ''}`
+   const free = await T.freeKb(TASK)
+-  const need = Math.ceil((data.length * 2.4) / 1024)
++  const need = Math.ceil((size * 2.4) / 1024)
+   if (free < need) throw new Error(`The TV needs about ${Math.round(need / 1024)} MB free to install this, and has ${Math.round(free / 1024)} MB. TV extras → Storage can clear app caches.`)
+   log(TASK, 'cmd', `install ${basename(path)} (${name})`)
++  // Read only now, once the checks above have passed, and not kept past the upload.
++  const data = readFileSync(path)
+   try {
+     await T.pushB64(TASK, data, TMP, (i, n) => progress({ tool: 'sideload', received: i, total: n, phase: 'install' }))
+     const out = await T.sh(TASK, `pm install -r ${TMP}`, { timeoutMs: 300000 })
+diff --git a/tests/apk.test.ts b/tests/apk.test.ts
+index c549e42..b1cd5dc 100644
+--- a/tests/apk.test.ts
++++ b/tests/apk.test.ts
+@@ -1,6 +1,9 @@
+ import { deflateRawSync } from 'node:zlib'
+ import { describe, expect, it } from 'vitest'
+-import { apkInfo, manifestInfo } from '../src/main/apk'
++import { mkdtempSync, writeFileSync } from 'node:fs'
++import { tmpdir } from 'node:os'
++import { join } from 'node:path'
++import { apkInfo, apkInfoFromFile, manifestInfo } from '../src/main/apk'
+ 
+ /** A binary AndroidManifest.xml with one <manifest> element: package and versionName as strings, versionCode as an int. */
+ function manifest(pkg: string, versionName: string, versionCode: number): Buffer {
+@@ -51,4 +54,18 @@ describe('reading an APK', () => {
+     expect(apkInfo(Buffer.from('not a zip at all'))).toBeNull()
+     expect(apkInfo(zip('readme.txt', Buffer.from('hi')))).toBeNull()
+   })
++
++  it('reads the same answer from a file on disk', () => {
++    const file = join(mkdtempSync(join(tmpdir(), 'cytv-apk-')), 'a.apk')
++    writeFileSync(file, zip('AndroidManifest.xml', manifest('com.example.tv', '1.0', 7)))
++    expect(apkInfoFromFile(file)).toEqual({ package: 'com.example.tv', versionName: '1.0', versionCode: 7 })
++    writeFileSync(file, 'not a zip at all')
++    expect(apkInfoFromFile(file)).toBeNull()
++    expect(apkInfoFromFile(join(tmpdir(), 'cytv-no-such-file.apk'))).toBeNull()
++  })
++
++  it('refuses a manifest that inflates to far more than a manifest can be', () => {
++    // 20 MB of zeros packs into a few KB; it must not be expanded.
++    expect(apkInfo(zip('AndroidManifest.xml', Buffer.alloc(20 * 1024 * 1024)))).toBeNull()
++  })
+ })
