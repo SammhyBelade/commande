@@ -1,0 +1,88 @@
+diff --git a/src/main/index.ts b/src/main/index.ts
+index 75a298a..333808b 100644
+--- a/src/main/index.ts
++++ b/src/main/index.ts
+@@ -1,5 +1,5 @@
+ import { app, BrowserWindow, dialog, ipcMain, session, shell } from 'electron'
+-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
++import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+ import { join } from 'node:path'
+ import { pathToFileURL } from 'node:url'
+ import { configurePaths, paths } from './paths'
+@@ -36,12 +36,22 @@ interface Settings {
+ }
+ 
+ function readSettings(): Settings {
+-  try { return JSON.parse(readFileSync(paths.settings, 'utf8')) } catch { return {} }
++  let text: string
++  try { text = readFileSync(paths.settings, 'utf8') } catch { return {} }
++  try { return JSON.parse(text) } catch {
++    // Unreadable, not missing: keep it for the owner instead of letting the next save overwrite it.
++    try { if (!existsSync(paths.settings + '.corrupt')) renameSync(paths.settings, paths.settings + '.corrupt') } catch { /* keep going */ }
++    log('settings', 'error', 'settings.json could not be read; starting with empty settings (the old file is kept as settings.json.corrupt)')
++    return {}
++  }
+ }
+ 
++/** Written to a temp file and renamed, so a crash mid-write never leaves half a settings file. */
+ function writeSettings(s: Settings): void {
+   mkdirSync(paths.data, { recursive: true })
+-  writeFileSync(paths.settings, JSON.stringify(s, null, 2))
++  const tmp = paths.settings + '.tmp'
++  writeFileSync(tmp, JSON.stringify(s, null, 2), { mode: 0o600 })
++  renameSync(tmp, paths.settings)
+ }
+ 
+ const knownTvs = (): KnownTv[] => listTvs(readSettings())
+diff --git a/src/main/launcher.ts b/src/main/launcher.ts
+index f3996b0..d58e140 100644
+--- a/src/main/launcher.ts
++++ b/src/main/launcher.ts
+@@ -94,7 +94,10 @@ function tvKey(): string {
+ 
+ function readStockFile(): Record<string, string> {
+   try {
+-    return existsSync(stockFile()) ? (JSON.parse(readFileSync(stockFile(), 'utf8')) as Record<string, string>) : {}
++    if (!existsSync(stockFile())) return {}
++    const raw = JSON.parse(readFileSync(stockFile(), 'utf8')) as Record<string, unknown>
++    // Only valid package names come back: the value goes into shell commands on the TV.
++    return Object.fromEntries(Object.entries(raw).filter(([, v]) => typeof v === 'string' && T.PACKAGE_RE.test(v))) as Record<string, string>
+   } catch {
+     return {}
+   }
+diff --git a/src/main/toolchain.ts b/src/main/toolchain.ts
+index 5bcf60a..c84ff6d 100644
+--- a/src/main/toolchain.ts
++++ b/src/main/toolchain.ts
+@@ -214,7 +214,7 @@ export const KEYSTORE = { password: 'cleanyourtv', alias: 'cleanyourtv' }
+  */
+ export async function pair(host: string, pairPort: number, code: string, connectPort: number): Promise<ApplyResult> {
+   const port = (p: unknown): boolean => Number.isInteger(p) && (p as number) >= 1 && (p as number) <= 65535
+-  if (!/^[A-Za-z0-9.-]+$/.test(host) || !/^\d{6}$/.test(code) || !port(pairPort) || !port(connectPort)) {
++  if (!/^[A-Za-z0-9][A-Za-z0-9.-]*$/.test(host) || !/^\d{6}$/.test(code) || !port(pairPort) || !port(connectPort)) {
+     return { ok: false, summary: 'Enter the IP address, both ports and the 6-digit code shown on the TV.', warnings: [] }
+   }
+   if (!platformToolsReady()) {
+diff --git a/tests/security.test.ts b/tests/security.test.ts
+index 30b1041..928fba5 100644
+--- a/tests/security.test.ts
++++ b/tests/security.test.ts
+@@ -180,3 +180,18 @@ describe('pinned upstream', () => {
+     expect(source.dataSha256).toBe(pin.dataSha256)
+   })
+ })
++
++describe('hardening patches', () => {
++  it('pair refuses a host that starts with a dash', async () => {
++    const { pair } = await import('../src/main/toolchain')
++    const r = await pair('-oProxyCommand', 1234, '123456', 5555)
++    expect(r.ok).toBe(false)
++  })
++
++  it('a stock-launchers.json entry that is not a package name is ignored', async () => {
++    const { stockOnTv } = await import('../src/main/launcher')
++    mkdirSync(join(home, 'data'), { recursive: true })
++    writeFileSync(join(home, 'data', 'stock-launchers.json'), JSON.stringify({ 'x': 'a.b; reboot' }))
++    expect(stockOnTv(new Set(['a.b; reboot']))).not.toBe('a.b; reboot')
++  })
++})
